@@ -1,5 +1,6 @@
 {
-  "name": "Loop Forge AI",
+  "name": "Loop Forge迭代优化",
   "description": "一个使用Gemini API进行文档或代码的迭代撰写和审查的Web应用程序。用户可以上传背景资料，AI撰写者生成内容，AI审查者提供反馈和评分，此过程循环进行直到满足条件。",
-  "requestFramePermissions": []
+  "requestFramePermissions": [],
+  "prompt": ""
 }

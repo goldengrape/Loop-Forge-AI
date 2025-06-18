@@ -8,7 +8,7 @@ import { Button } from './components/Button';
 import { LoadingSpinner } from './components/LoadingSpinner';
 import { generateContent, parseReviewerResponse, parseWriterResponse, Type } from './services/geminiService';
 import { IterationStep, AppStatus, WriterMultiDraftOutput, UploadedFilePart, ReviewerMultiReviewResponse } from './types';
-import { GEMINI_MODEL_TEXT, DEFAULT_MIN_ITERATIONS, DEFAULT_MAX_ITERATIONS, DEFAULT_TARGET_SCORE, DEFAULT_NUMBER_OF_DRAFTS } from './constants';
+import { DEFAULT_GEMINI_MODEL_TEXT, DEFAULT_MIN_ITERATIONS, DEFAULT_MAX_ITERATIONS, DEFAULT_TARGET_SCORE, DEFAULT_NUMBER_OF_DRAFTS } from './constants';
 
 const writerDraftSchema = {
   type: Type.OBJECT,
@@ -56,11 +56,12 @@ const reviewerSchema = {
 };
 
 
-const App: React.FC = () => {
+const App = (): JSX.Element => {
   const [backgroundMaterial, setBackgroundMaterial] = useState<UploadedFilePart[]>([]);
   const [initialWriterPrompt, setInitialWriterPrompt] = useState<string>("请根据背景资料撰写一份[文档类型]。");
   const [reviewerCriteria, setReviewerCriteria] = useState<string>("请审查以下内容，关注[审查方面]，并给出0-100分的评分。");
 
+  const [modelNameInput, setModelNameInput] = useState<string>(DEFAULT_GEMINI_MODEL_TEXT);
   const [minIterationsInput, setMinIterationsInput] = useState<string>(String(DEFAULT_MIN_ITERATIONS));
   const [maxIterationsInput, setMaxIterationsInput] = useState<string>(String(DEFAULT_MAX_ITERATIONS));
   const [targetScoreInput, setTargetScoreInput] = useState<string>(String(DEFAULT_TARGET_SCORE));
@@ -80,6 +81,11 @@ const App: React.FC = () => {
 
   const [totalInputTokensUsed, setTotalInputTokensUsed] = useState<number>(0);
   const [totalOutputTokensUsed, setTotalOutputTokensUsed] = useState<number>(0);
+
+  const [pastedText, setPastedText] = useState<string>("");
+  const [pastedTextFeedback, setPastedTextFeedback] = useState<string>('');
+  const [pastedTextFeedbackType, setPastedTextFeedbackType] = useState<'success' | 'error' | 'info'>('info');
+
 
   const commonWriterSystemPrompt = `你是一位专业的撰写者。你的任务是根据用户提供的背景资料、撰写要求以及可能的审查意见来生成或修订内容。
 你必须严格按照提供的JSON Schema返回你的输出。
@@ -112,18 +118,36 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
 
   const handleFileUpload = useCallback((uploadedFileParts: UploadedFilePart[]) => {
     setBackgroundMaterial(prev => [...prev, ...uploadedFileParts]);
-    setErrorMessage(null);
+    setErrorMessage(null); // Clear general errors when a file operation succeeds
   }, []);
 
   const handleRemoveFile = useCallback((fileIdToRemove: string) => {
     setBackgroundMaterial(prev => prev.filter(filePart => filePart.id !== fileIdToRemove));
   }, []);
 
+  const handleAddPastedText = useCallback(() => {
+    if (!pastedText.trim()) {
+      setPastedTextFeedback('请输入文本内容后再添加。');
+      setPastedTextFeedbackType('error');
+      return;
+    }
+    const newTextFilePart: UploadedFilePart = {
+      id: `pasted-text-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+      name: `粘贴文本 ${backgroundMaterial.filter(m => m.id.startsWith('pasted-text-')).length + 1}`,
+      part: { text: pastedText.trim() },
+    };
+    handleFileUpload([newTextFilePart]); // Leverage existing logic
+    setPastedText('');
+    setPastedTextFeedback(`"${newTextFilePart.name}" 已添加为背景资料。`);
+    setPastedTextFeedbackType('success');
+  }, [pastedText, backgroundMaterial, handleFileUpload]);
+
 
   const resetState = () => {
     setBackgroundMaterial([]);
     setInitialWriterPrompt("请根据背景资料撰写一份[文档类型]。");
     setReviewerCriteria("请审查以下内容，关注[审查方面]，并给出0-100分的评分。");
+    setModelNameInput(DEFAULT_GEMINI_MODEL_TEXT);
     setMinIterationsInput(String(DEFAULT_MIN_ITERATIONS));
     setMaxIterationsInput(String(DEFAULT_MAX_ITERATIONS));
     setTargetScoreInput(String(DEFAULT_TARGET_SCORE));
@@ -139,6 +163,9 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
     setManualContinueCountInput("1");
     setTotalInputTokensUsed(0);
     setTotalOutputTokensUsed(0);
+    setPastedText("");
+    setPastedTextFeedback("");
+    setPastedTextFeedbackType("info");
   };
 
   const validateInputs = () => {
@@ -146,7 +173,12 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
     const maxIter = parseInt(maxIterationsInput, 10);
     const targetScoreNum = parseInt(targetScoreInput, 10);
     const numDrafts = parseInt(numberOfDraftsInput, 10);
+    const modelName = modelNameInput.trim();
 
+    if (!modelName) {
+      setErrorMessage("请输入模型名称。");
+      return false;
+    }
     if (isNaN(minIter) || minIter < 1) {
       setErrorMessage("最小迭代次数必须是大于或等于1的数字。");
       return false;
@@ -171,14 +203,12 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
       setErrorMessage("请输入审查者要求。");
       return false;
     }
-    return { minIter, maxIter, targetScoreNum, numDrafts };
+    return { minIter, maxIter, targetScoreNum, numDrafts, modelName };
   };
 
   const runIterations = useCallback(async (
     startingIterationNumber: number,
     numberOfIterationsToDo: number,
-    // initialMultiWriterOutput: WriterMultiDraftOutput | null, // To carry over if paused
-    // initialReviewerOutput: ReviewerMultiReviewResponse | null,
     isManualContinuation: boolean,
     manualReviewOverride?: string
   ) => {
@@ -187,7 +217,7 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
       setCurrentStatus(AppStatus.Idle);
       return;
     }
-    const { minIter, maxIter, targetScoreNum, numDrafts } = validationResult;
+    const { minIter, maxIter, targetScoreNum, numDrafts, modelName } = validationResult;
 
     let iterationWriterOutput: WriterMultiDraftOutput | null = currentMultiWriterOutput;
     let iterationReviewOutput: ReviewerMultiReviewResponse | null = currentReview;
@@ -201,6 +231,7 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
     const newIterationStepsBatch: IterationStep[] = [];
     setCurrentStatus(AppStatus.Processing);
     setErrorMessage(null);
+    setPastedTextFeedback(''); // Clear paste text feedback during processing
 
     const activeBackgroundParts = backgroundMaterial.map(bfp => bfp.part);
 
@@ -218,9 +249,9 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
       const previousStep = iterationSteps.length > 0 ? iterationSteps[iterationSteps.length -1] : (newIterationStepsBatch.length > 0 ? newIterationStepsBatch[newIterationStepsBatch.length -1] : null);
 
 
-      if (overallIterationNumber === 1 && !iterationWriterOutput) { // First run ever
+      if (overallIterationNumber === 1 && !iterationWriterOutput) { 
         writerInstructionForUser = `初始撰写要求:\n${initialWriterPrompt}\n\n请生成 ${numDrafts} 份独立的草稿。严格按照JSON Schema返回输出。`;
-      } else { // Subsequent run (automatic or manual continuation)
+      } else { 
         let feedbackForWriter = previousStep?.review?.consolidatedFeedbackForNextIteration || "无先前审查反馈。";
         let baseDocumentContent = "无先前选定文档内容。";
 
@@ -229,14 +260,14 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
         }
 
         if (isManualContinuation && i === 0 && manualReviewOverride) {
-            feedbackForWriter = manualReviewOverride; // User provided feedback takes precedence for manual continue
+            feedbackForWriter = manualReviewOverride; 
         }
         writerInstructionForUser = `原始撰写要求: ${initialWriterPrompt}\n先前选定草稿的内容提示 (部分，仅供参考，主要依据整合审查意见):\n${baseDocumentContent.substring(0, 300)}...\n\n整合审查意见 (或用户修改/确认的审查意见):\n${feedbackForWriter}\n\n请根据以上信息和审查意见，在选定草稿的基础上进行修改，并生成 ${numDrafts} 份独立的草稿。严格按照JSON Schema返回输出。`;
       }
       writerUserParts.push({ text: writerInstructionForUser });
 
       const writerResponse = await generateContent(
-        GEMINI_MODEL_TEXT,
+        modelName,
         writerUserParts,
         { systemInstruction: commonWriterSystemPrompt, responseSchema: writerSchema }
       );
@@ -260,12 +291,8 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
       const reviewerUserPartsText = `审查标准:\n${reviewerCriteria}\n\n待审查的 ${numDrafts} 份草稿内容如下:\n` +
         iterationWriterOutput.drafts.map((draft, index) => `--- 草稿 ${index + 1} ---\n${draft.documentContent}\n--- END 草稿 ${index + 1} ---`).join('\n\n');
       
-      const reviewerInstructionLog = `审查标准:\n${reviewerCriteria}\n\n审查 ${numDrafts} 份草稿 (内容已截断以适应日志):\n` +
-        iterationWriterOutput.drafts.map((draft, index) => ` 草稿 ${index + 1}: ${draft.documentContent.substring(0,200)}...`).join('\n');
-
-
       const reviewerResponse = await generateContent(
-        GEMINI_MODEL_TEXT,
+        modelName,
         [...activeBackgroundParts, { text: reviewerUserPartsText }],
         { systemInstruction: commonReviewerSystemPrompt, responseSchema: reviewerSchema }
       );
@@ -288,9 +315,8 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
         currentScore = reviewData.draftReviews[reviewData.selectedDraftIndex].score;
       } else {
         console.warn("Reviewer selected an invalid draft index. Defaulting score to 0.", reviewData);
-        currentScore = 0; // Or handle as an error
+        currentScore = 0; 
       }
-
 
       const step: IterationStep = {
         id: overallIterationNumber,
@@ -298,7 +324,7 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
         writerOutput: iterationWriterOutput,
         writerInputTokens: stepWriterInputTokens,
         writerOutputTokens: stepWriterOutputTokens,
-        review: iterationReviewOutput, // Storing the full multi-review response
+        review: iterationReviewOutput, 
       };
       newIterationStepsBatch.push(step);
       setIterationSteps(prev => [...prev, step]);
@@ -315,16 +341,16 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
           return;
         }
       }
-    } // End of for loop for iterations
+    } 
 
     const finalSelectedDraftScore = iterationReviewOutput?.draftReviews[iterationReviewOutput.selectedDraftIndex]?.score || 0;
     setStatusMessage(`已完成指定 ${isManualContinuation ? numberOfIterationsToDo : '所有'}轮迭代。流程暂停。最终选定草稿评分: ${finalSelectedDraftScore}`);
     setCurrentStatus(AppStatus.Paused);
 
   }, [
-    backgroundMaterial, initialWriterPrompt, reviewerCriteria,
+    backgroundMaterial, initialWriterPrompt, reviewerCriteria, modelNameInput,
     iterationSteps, minIterationsInput, maxIterationsInput, targetScoreInput, numberOfDraftsInput,
-    commonWriterSystemPrompt, commonReviewerSystemPrompt, currentMultiWriterOutput, currentReview
+    commonWriterSystemPrompt, commonReviewerSystemPrompt, currentMultiWriterOutput, currentReview, validateInputs
   ]);
 
 
@@ -346,7 +372,7 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
       setCurrentStatus(AppStatus.Error);
       setStatusMessage("处理失败。");
     }
-  }, [validateInputs, runIterations]);
+  }, [validateInputs, runIterations, modelNameInput]);
 
   const handleManualContinue = useCallback(async () => {
     const count = parseInt(manualContinueCountInput, 10);
@@ -370,9 +396,9 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
 
     try {
       await runIterations(startingIterNum, count, true, editableReviewComments);
-    } catch (error: any) {
-      console.error("手动继续过程中发生错误:", error);
-      setErrorMessage(`错误: ${error.message || '发生未知错误'}`);
+    } catch (e: any) { 
+      console.error("手动继续过程中发生错误:", e); 
+      setErrorMessage(`错误: ${e.message || '发生未知错误'}`); 
       setCurrentStatus(AppStatus.Error);
       setStatusMessage("手动处理失败。");
     }
@@ -403,23 +429,56 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
     <div className="min-h-screen bg-slate-900 text-slate-200 p-4 sm:p-6 lg:p-8 flex flex-col">
       <header className="text-center mb-10">
         <h1 className="text-5xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-sky-400 to-cyan-300 py-2">
-          Gemini 迭代撰写与审查
+          Loop Forge迭代优化
         </h1>
         <p className="text-slate-400 mt-3 text-lg">通过AI驱动的迭代优化您的文档和代码，具有结构化输出和双栏视图。</p>
       </header>
 
       <section aria-labelledby="config-and-controls-heading" className="mb-10">
         <h2 id="config-and-controls-heading" className="sr-only">配置与控制</h2>
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-x-8 gap-y-6">
+        <div className="space-y-8">
 
-          {/* Column 1: File Upload & Prompts */}
-          <div className="lg:col-span-2 space-y-6">
+          {/* Input Materials & Prompts Section */}
+          <div className="space-y-6">
             <div className="bg-slate-800/70 p-6 rounded-xl shadow-2xl backdrop-blur-sm border border-slate-700/50 hover:border-slate-600 transition-all">
               <h3 className="text-xl font-semibold text-sky-300 mb-5 border-b border-slate-700 pb-3">输入资料与要求</h3>
-              <FileUpload onFileUploaded={handleFileUpload} disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} />
+              
+              <FileUpload 
+                onFileUploaded={handleFileUpload} 
+                disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} 
+              />
+
+              <div className="mt-6 pt-6 border-t border-slate-700/50">
+                <label htmlFor="pasted-text-input" className="block text-sm font-medium text-slate-300 mb-2">
+                  或粘贴背景文本 (Or Paste Background Text)
+                </label>
+                <textarea
+                  id="pasted-text-input"
+                  rows={5}
+                  value={pastedText}
+                  onChange={(e) => {
+                    setPastedText(e.target.value);
+                    if (pastedTextFeedback) setPastedTextFeedback(''); 
+                  }}
+                  disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)}
+                  className={`${inputStyleClasses} scrollbar-thin`}
+                  placeholder="在此处粘贴文本内容..."
+                  aria-label="粘贴背景文本区域"
+                />
+                <Button
+                  onClick={handleAddPastedText}
+                  disabled={isProcessing || !pastedText.trim() || (currentStatus === AppStatus.Paused && !isReviewEditable)}
+                  className="mt-3 w-full sm:w-auto px-5 py-2.5"
+                  variant="secondary"
+                >
+                  添加粘贴文本为背景资料
+                </Button>
+                {pastedTextFeedback && <p id="pasted-text-feedback" className={`mt-2.5 text-sm ${pastedTextFeedbackType === 'success' ? 'text-green-400' : pastedTextFeedbackType === 'error' ? 'text-red-400' : 'text-slate-400'}`}>{pastedTextFeedback}</p>}
+              </div>
+
               {backgroundMaterial.length > 0 && (
-                <div className="mt-4 p-4 bg-slate-700/60 rounded-lg">
-                  <h4 className="text-base font-medium text-slate-300 mb-3">已上传资料:</h4>
+                <div className="mt-6 pt-6 border-t border-slate-700/50">
+                  <h4 className="text-base font-medium text-slate-300 mb-3">已添加背景资料:</h4>
                   <ul className="space-y-2 max-h-40 overflow-y-auto scrollbar-thin pr-1">
                     {backgroundMaterial.map((file) => (
                       <li key={file.id} className="flex justify-between items-center text-sm text-slate-300 bg-slate-600/70 p-2.5 rounded-md hover:bg-slate-600 transition-colors">
@@ -446,7 +505,7 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
                   </ul>
                 </div>
               )}
-              <div className="mt-5">
+              <div className={`mt-5 ${backgroundMaterial.length > 0 ? 'pt-6 border-t border-slate-700/50' : 'pt-0'}`}>
                 <PromptInput
                   id="writer-prompt"
                   label="初始撰写者要求 (Writer Prompt)"
@@ -469,99 +528,109 @@ JSON对象必须包含 "draftReviews" (数组), "selectedDraftIndex" (数字), �
             </div>
           </div>
 
-          {/* Column 2: Iteration Parameters & Controls */}
-          <div className="lg:col-span-1 space-y-6">
-            <div className="bg-slate-800/70 p-6 rounded-xl shadow-2xl backdrop-blur-sm border border-slate-700/50 hover:border-slate-600 transition-all">
-              <h3 className="text-xl font-semibold text-sky-300 mb-5 border-b border-slate-700 pb-3">迭代参数</h3>
-              <div className="space-y-5">
-                <div>
-                  <label htmlFor="num-drafts" className="block text-sm font-medium text-slate-300 mb-1.5">每次迭代草稿数量 (1-3)</label>
-                  <input type="number" id="num-drafts" value={numberOfDraftsInput} onChange={e => setNumberOfDraftsInput(e.target.value)} min="1" max="3" disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} className={inputStyleClasses} />
-                </div>
-                <div>
-                  <label htmlFor="min-iterations" className="block text-sm font-medium text-slate-300 mb-1.5">最小迭代次数</label>
-                  <input type="number" id="min-iterations" value={minIterationsInput} onChange={e => setMinIterationsInput(e.target.value)} min="1" disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} className={inputStyleClasses} />
-                </div>
-                <div>
-                  <label htmlFor="max-iterations" className="block text-sm font-medium text-slate-300 mb-1.5">最大迭代次数</label>
-                  <input type="number" id="max-iterations" value={maxIterationsInput} onChange={e => setMaxIterationsInput(e.target.value)} min="1" disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} className={inputStyleClasses} />
-                </div>
-                <div>
-                  <label htmlFor="target-score" className="block text-sm font-medium text-slate-300 mb-1.5">目标评分 (0-100)</label>
-                  <input type="number" id="target-score" value={targetScoreInput} onChange={e => setTargetScoreInput(e.target.value)} min="0" max="100" disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} className={inputStyleClasses} />
-                </div>
+          {/* Iteration Parameters Card */}
+          <div className="bg-slate-800/70 p-6 rounded-xl shadow-2xl backdrop-blur-sm border border-slate-700/50 hover:border-slate-600 transition-all">
+            <h3 className="text-xl font-semibold text-sky-300 mb-5 border-b border-slate-700 pb-3">迭代参数</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-5 items-end">
+              <div>
+                <label htmlFor="model-name" className="block text-sm font-medium text-slate-300 mb-1.5">模型名称 (Model Name)</label>
+                <input 
+                  type="text" 
+                  id="model-name" 
+                  value={modelNameInput} 
+                  onChange={e => setModelNameInput(e.target.value)} 
+                  disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} 
+                  className={inputStyleClasses}
+                  placeholder={`例如 ${DEFAULT_GEMINI_MODEL_TEXT}`}
+                />
+              </div>
+              <div>
+                <label htmlFor="num-drafts" className="block text-sm font-medium text-slate-300 mb-1.5">每次迭代草稿数量 (1-3)</label>
+                <input type="number" id="num-drafts" value={numberOfDraftsInput} onChange={e => setNumberOfDraftsInput(e.target.value)} min="1" max="3" disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} className={inputStyleClasses} />
+              </div>
+              <div>
+                <label htmlFor="min-iterations" className="block text-sm font-medium text-slate-300 mb-1.5">最小迭代次数</label>
+                <input type="number" id="min-iterations" value={minIterationsInput} onChange={e => setMinIterationsInput(e.target.value)} min="1" disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} className={inputStyleClasses} />
+              </div>
+              <div>
+                <label htmlFor="max-iterations" className="block text-sm font-medium text-slate-300 mb-1.5">最大迭代次数</label>
+                <input type="number" id="max-iterations" value={maxIterationsInput} onChange={e => setMaxIterationsInput(e.target.value)} min="1" disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} className={inputStyleClasses} />
+              </div>
+              <div>
+                <label htmlFor="target-score" className="block text-sm font-medium text-slate-300 mb-1.5">目标评分 (0-100)</label>
+                <input type="number" id="target-score" value={targetScoreInput} onChange={e => setTargetScoreInput(e.target.value)} min="0" max="100" disabled={isProcessing || (currentStatus === AppStatus.Paused && !isReviewEditable)} className={inputStyleClasses} />
               </div>
             </div>
+          </div>
 
-            <div className="bg-slate-800/70 p-6 rounded-xl shadow-2xl backdrop-blur-sm border border-slate-700/50 hover:border-slate-600 transition-all">
-              <h3 className="text-xl font-semibold text-sky-300 mb-5 border-b border-slate-700 pb-3">控制与状态</h3>
-              <div className="space-y-4">
-                {statusMessage && <p className={`mb-2 p-3 rounded-md text-sm ${errorMessage ? 'bg-red-800/70 text-red-100 border border-red-700' : 'bg-sky-800/70 text-sky-100 border border-sky-700'}`}>{statusMessage}</p>}
-                {errorMessage && !statusMessage && <p className="mb-2 p-3 bg-red-800/70 text-red-100 rounded-md text-sm border border-red-700">{errorMessage}</p>}
+          {/* Controls & Status Card */}
+          <div className="bg-slate-800/70 p-6 rounded-xl shadow-2xl backdrop-blur-sm border border-slate-700/50 hover:border-slate-600 transition-all">
+            <h3 className="text-xl font-semibold text-sky-300 mb-5 border-b border-slate-700 pb-3">控制与状态</h3>
+            <div className="space-y-4">
+              {statusMessage && <p className={`mb-2 p-3 rounded-md text-sm ${errorMessage ? 'bg-red-800/70 text-red-100 border border-red-700' : 'bg-sky-800/70 text-sky-100 border border-sky-700'}`}>{statusMessage}</p>}
+              {errorMessage && !statusMessage && <p className="mb-2 p-3 bg-red-800/70 text-red-100 rounded-md text-sm border border-red-700">{errorMessage}</p>}
 
+              {(iterationSteps.length > 0 || isProcessing) && (
+                <div className="p-3.5 bg-slate-700/60 rounded-lg text-slate-300 text-sm space-y-1.5 border border-slate-600/50">
+                    <p>总输入 Token: <span className="font-semibold text-sky-300">{totalInputTokensUsed.toLocaleString()}</span></p>
+                    <p>总输出 Token: <span className="font-semibold text-sky-300">{totalOutputTokensUsed.toLocaleString()}</span></p>
+                </div>
+              )}
 
-                {(iterationSteps.length > 0 || isProcessing) && (
-                  <div className="p-3.5 bg-slate-700/60 rounded-lg text-slate-300 text-sm space-y-1.5 border border-slate-600/50">
-                      <p>总输入 Token: <span className="font-semibold text-sky-300">{totalInputTokensUsed.toLocaleString()}</span></p>
-                      <p>总输出 Token: <span className="font-semibold text-sky-300">{totalOutputTokensUsed.toLocaleString()}</span></p>
-                  </div>
-                )}
+              {canStartProcess && !isReviewEditable && (
+                <Button
+                  onClick={startIterativeProcess}
+                  className="w-full text-lg py-3"
+                  disabled={isProcessing}
+                  variant="primary"
+                >
+                  {iterationSteps.length > 0 ? '重新开始迭代' : '开始迭代流程'}
+                </Button>
+              )}
+               <Button onClick={resetState} className="w-full py-3" disabled={isProcessing} variant="secondary">
+                 重置所有
+               </Button>
 
-                {canStartProcess && !isReviewEditable && (
-                  <Button
-                    onClick={startIterativeProcess}
-                    className="w-full text-lg py-3"
+              {isProcessing && (
+                <div className="flex items-center justify-center w-full py-3 bg-slate-700/50 rounded-lg">
+                  <LoadingSpinner />
+                  <span className="ml-3 text-lg text-slate-300">处理中...</span>
+                </div>
+              )}
+              {currentStatus === AppStatus.Paused && currentMultiWriterOutput && currentReview && (
+                <Button onClick={downloadFinalDocument} className="w-full text-lg py-3" variant="success" disabled={isProcessing}>
+                  下载选定文档
+                </Button>
+              )}
+              {isReviewEditable && currentStatus === AppStatus.Paused && (
+                <div className="mt-4 p-4 bg-slate-700/60 rounded-lg border border-slate-600/50">
+                  <h4 className="text-md font-semibold text-sky-300 mb-3">编辑整合审查意见</h4>
+                  <textarea
+                    value={editableReviewComments}
+                    onChange={(e) => setEditableReviewComments(e.target.value)}
+                    rows={5}
+                    className="block w-full rounded-lg border-slate-600 bg-slate-800/70 shadow-sm focus:border-sky-500 focus:ring-2 focus:ring-sky-500 focus:ring-opacity-50 sm:text-sm p-3 text-slate-100 placeholder-slate-400 scrollbar-thin transition-colors"
                     disabled={isProcessing}
-                    variant="primary"
-                  >
-                    {iterationSteps.length > 0 ? '重新开始迭代' : '开始迭代流程'}
-                  </Button>
-                )}
-                 <Button onClick={resetState} className="w-full py-3" disabled={isProcessing} variant="secondary">
-                   重置所有
-                 </Button>
-
-                {isProcessing && (
-                  <div className="flex items-center justify-center w-full py-3 bg-slate-700/50 rounded-lg">
-                    <LoadingSpinner />
-                    <span className="ml-3 text-lg text-slate-300">处理中...</span>
-                  </div>
-                )}
-                {currentStatus === AppStatus.Paused && currentMultiWriterOutput && currentReview && (
-                  <Button onClick={downloadFinalDocument} className="w-full text-lg py-3" variant="success" disabled={isProcessing}>
-                    下载选定文档
-                  </Button>
-                )}
-                {isReviewEditable && currentStatus === AppStatus.Paused && (
-                  <div className="mt-4 p-4 bg-slate-700/60 rounded-lg border border-slate-600/50">
-                    <h4 className="text-md font-semibold text-sky-300 mb-3">编辑整合审查意见</h4>
-                    <textarea
-                      value={editableReviewComments}
-                      onChange={(e) => setEditableReviewComments(e.target.value)}
-                      rows={5}
-                      className="block w-full rounded-lg border-slate-600 bg-slate-800/70 shadow-sm focus:border-sky-500 focus:ring-2 focus:ring-sky-500 focus:ring-opacity-50 sm:text-sm p-3 text-slate-100 placeholder-slate-400 scrollbar-thin transition-colors"
+                    aria-label="可编辑的整合审查意见"
+                  />
+                  <div className="mt-4 flex items-center gap-3">
+                    <label htmlFor="manual-continue-count" className="text-sm text-slate-300 whitespace-nowrap">继续轮次:</label>
+                    <input
+                      type="number"
+                      id="manual-continue-count"
+                      value={manualContinueCountInput}
+                      onChange={(e) => setManualContinueCountInput(e.target.value)}
+                      min="1"
+                      className="block w-24 rounded-lg border-slate-600 bg-slate-800/70 shadow-sm focus:border-sky-500 focus:ring-2 focus:ring-sky-500 focus:ring-opacity-50 sm:text-sm p-2.5 text-slate-100 transition-colors"
                       disabled={isProcessing}
-                      aria-label="可编辑的整合审查意见"
+                      aria-label="手动继续轮次数量"
                     />
-                    <div className="mt-4 flex items-center gap-3">
-                      <label htmlFor="manual-continue-count" className="text-sm text-slate-300 whitespace-nowrap">继续轮次:</label>
-                      <input
-                        type="number"
-                        id="manual-continue-count"
-                        value={manualContinueCountInput}
-                        onChange={(e) => setManualContinueCountInput(e.target.value)}
-                        min="1"
-                        className="block w-24 rounded-lg border-slate-600 bg-slate-800/70 shadow-sm focus:border-sky-500 focus:ring-2 focus:ring-sky-500 focus:ring-opacity-50 sm:text-sm p-2.5 text-slate-100 transition-colors"
-                        disabled={isProcessing}
-                        aria-label="手动继续轮次数量"
-                      />
-                      <Button onClick={handleManualContinue} className="bg-orange-600 hover:bg-orange-700 flex-grow py-2.5" disabled={isProcessing}>
-                        手动继续
-                      </Button>
-                    </div>
+                    <Button onClick={handleManualContinue} className="bg-orange-600 hover:bg-orange-700 flex-grow py-2.5" disabled={isProcessing}>
+                      手动继续
+                    </Button>
                   </div>
-                )}
-              </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
